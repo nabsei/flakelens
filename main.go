@@ -1,0 +1,240 @@
+// flakelens finds jobs that are flaky — not broken — by reading GitHub
+// Actions history a repo already has, no rerun or test-report artifact
+// required.
+//
+// The signal: within a single workflow run, most jobs share the same commit,
+// so a genuine code problem (a real compile error, a real lint violation)
+// tends to fail most or all jobs in that run together. A job that fails
+// *alone*, while its sibling jobs in the same run pass, is not explained by
+// "the code was broken" — it's isolated, and isolated, repeated failures are
+// exactly what flaky (non-deterministic) jobs look like.
+//
+// This was chosen after two rejected mechanisms, verified empirically against
+// rust-lang/rust-analyzer before writing this: (1) explicit reruns
+// (run_attempt > 1) are too rare to find in a practical history window —
+// nobody clicks "re-run failed jobs" often enough; (2) per-job raw failure
+// rate alone is misleading — several jobs can share the same failure rate
+// because they all failed together on the same handful of genuinely broken
+// runs, which isolated-failure counting correctly excludes.
+//
+// A third gap surfaced by testing against denoland/deno: a PR branch can fail
+// the same isolated job twice in a row for a perfectly deterministic reason —
+// the author is mid-debugging still-broken new code (observed: a new musl
+// build target failing on the same toolchain relocation error across two
+// pushes to the same PR). That looks identical to flakiness under "isolated +
+// repeated". The first fix tried (drop all pull_request-event runs) was too
+// blunt: re-testing against rust-lang/rust-analyzer showed the original
+// proc-macro-srv signal came from four *different* PR branches by different
+// authors — excluding PR runs entirely threw that away, even though
+// cross-branch repetition is if anything a stronger flakiness signal than a
+// post-merge repeat (master/main is reused forever, so "same branch" can't be
+// used to distinguish repeat merges from a single in-progress PR there).
+//
+// The actual discriminator is "same branch, still being iterated on" vs.
+// "different branches/commits, unrelated to each other" — not PR-vs-push.
+// Repeated isolated failures on the *same* non-default branch collapse to one
+// occurrence (presumptively the same still-broken code, not flakiness);
+// failures on the default branch always count individually, since a rerun of
+// "master" is never a rerun of the same in-progress fix.
+//
+// KNOWN LIMITATION (found testing against pola-rs/polars, not fixed): this
+// tool operates at job granularity, but a job can be a monolithic test suite
+// (e.g. "coverage-python" running ~35k tests). Two unrelated PRs each
+// breaking one unrelated test of their own (observed: a temporal-handling PR
+// failing a datetime test, a parquet-filter PR failing an iceberg/parquet
+// test) get counted as the same job repeating, even though they're two
+// different real bugs in two different tests that just happen to share a job
+// name. Fixing this needs the actual failing test name pulled from each job's
+// log, which requires a parser per test framework (pytest, cargo test, go
+// test, ...) — the same per-ecosystem "adapter" cost buildline deliberately
+// took on, and deliberately not taken on here yet. Until then: trust this
+// tool most on repos with narrow, single-purpose jobs (one target, one lint,
+// one binary); treat a hit on a whole-suite job as a lead to click through
+// and read, not a verdict.
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+
+	"github.com/google/go-github/v66/github"
+)
+
+// maxCoFailures: a failing job counts as "isolated" (not explained by a
+// broad, correlated failure) only when at most this many *other* jobs in the
+// same run also failed. Zero is the strict, clean signal; a small tolerance
+// allows for one unrelated pre-existing failure without excusing a job that
+// clearly failed alongside a real, broad breakage.
+const maxCoFailures = 0
+
+// minIsolatedFailures: report a job only once it has failed in isolation this
+// many times — one isolated failure could still be a one-off; a repeated
+// pattern is what makes it a flakiness candidate rather than noise.
+const minIsolatedFailures = 2
+
+type isolatedFailure struct {
+	runID   int64
+	headSHA string
+	branch  string
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: flakelens <owner/repo> [max-runs]")
+		os.Exit(2)
+	}
+	if err := run(os.Args[1], os.Args[2:]); err != nil {
+		fmt.Fprintln(os.Stderr, "flakelens:", err)
+		os.Exit(1)
+	}
+}
+
+func run(ownerRepo string, rest []string) error {
+	parts := strings.SplitN(ownerRepo, "/", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("expected owner/repo, got %q", ownerRepo)
+	}
+	owner, repo := parts[0], parts[1]
+
+	maxRuns := 100
+	if len(rest) > 0 {
+		fmt.Sscanf(rest[0], "%d", &maxRuns)
+	}
+
+	client := github.NewClient(nil)
+	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+		client = client.WithAuthToken(token)
+	}
+	ctx := context.Background()
+
+	repoInfo, _, err := client.Repositories.Get(ctx, owner, repo)
+	if err != nil {
+		return fmt.Errorf("looking up default branch: %w", err)
+	}
+	defaultBranch := repoInfo.GetDefaultBranch()
+
+	runsResp, _, err := client.Actions.ListRepositoryWorkflowRuns(ctx, owner, repo, &github.ListWorkflowRunsOptions{
+		Status:      "completed",
+		ListOptions: github.ListOptions{PerPage: maxRuns},
+	})
+	if err != nil {
+		return fmt.Errorf("listing workflow runs: %w", err)
+	}
+
+	byJob := make(map[string][]isolatedFailure)
+
+	for _, wr := range runsResp.WorkflowRuns {
+		jobsResp, _, err := client.Actions.ListWorkflowJobs(ctx, owner, repo, wr.GetID(), nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "flakelens: warning: skipping run %d: %v\n", wr.GetID(), err)
+			continue
+		}
+		jobs := jobsForCorrelation(jobsResp.Jobs)
+		if len(jobs) < 2 {
+			continue // no siblings to compare against
+		}
+
+		totalFailures := 0
+		for _, j := range jobs {
+			if j.GetConclusion() == "failure" {
+				totalFailures++
+			}
+		}
+
+		for _, j := range jobs {
+			if j.GetConclusion() != "failure" {
+				continue
+			}
+			coFailures := totalFailures - 1 // other jobs in this run that also failed
+			if coFailures > maxCoFailures {
+				continue // this run looks broadly broken, not isolated
+			}
+			name := j.GetName()
+			byJob[name] = append(byJob[name], isolatedFailure{
+				runID:   wr.GetID(),
+				headSHA: wr.GetHeadSHA(),
+				branch:  wr.GetHeadBranch(),
+			})
+		}
+	}
+
+	type report struct {
+		name     string
+		failures []isolatedFailure
+	}
+	var results []report
+	for name, failures := range byJob {
+		if countDistinctOccurrences(failures, defaultBranch) >= minIsolatedFailures {
+			results = append(results, report{name, failures})
+		}
+	}
+	sort.Slice(results, func(i, j int) bool { return len(results[i].failures) > len(results[j].failures) })
+
+	if len(results) == 0 {
+		fmt.Println("No jobs with repeated isolated failures found in the observed run history.")
+		return nil
+	}
+	fmt.Printf("Jobs that failed in isolation (siblings in the same run passed) on %d+ distinct branches/occasions:\n\n", minIsolatedFailures)
+	for _, r := range results {
+		fmt.Printf("- %s: %d isolated failures (%d distinct occurrences)\n",
+			r.name, len(r.failures), countDistinctOccurrences(r.failures, defaultBranch))
+		for _, f := range r.failures {
+			fmt.Printf("    commit %s, branch %s, https://github.com/%s/%s/actions/runs/%d\n",
+				f.headSHA[:min(8, len(f.headSHA))], f.branch, owner, repo, f.runID)
+		}
+	}
+	return nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// countDistinctOccurrences collapses repeated isolated failures that share
+// the same non-default branch into a single occurrence, since those are
+// presumptively the same still-broken code being iterated on within one PR,
+// not independent evidence of flakiness. Failures on the default branch are
+// never collapsed together: a rerun of "main"/"master" is a distinct commit
+// each time, never a rerun of the same in-progress fix.
+func countDistinctOccurrences(failures []isolatedFailure, defaultBranch string) int {
+	seen := make(map[string]bool)
+	for _, f := range failures {
+		key := f.branch
+		if key == defaultBranch {
+			key = fmt.Sprintf("run-%d", f.runID)
+		}
+		seen[key] = true
+	}
+	return len(seen)
+}
+
+// aggregatorJobNames are gate/summary jobs that depend on every other job and
+// so fail whenever ANY sibling fails. Left in, they'd co-fail alongside every
+// real isolated failure and mask it under maxCoFailures, while never being
+// isolated themselves. This is a name-based denylist for now; the more
+// general fix is reading each job's "needs" graph to detect fan-in gates
+// structurally instead of by name.
+var aggregatorJobNames = map[string]bool{
+	"conclusion":      true,
+	"all-green":       true,
+	"ci-success":      true,
+	"required-checks": true,
+	"success":         true,
+}
+
+func jobsForCorrelation(jobs []*github.WorkflowJob) []*github.WorkflowJob {
+	out := make([]*github.WorkflowJob, 0, len(jobs))
+	for _, j := range jobs {
+		if aggregatorJobNames[j.GetName()] {
+			continue
+		}
+		out = append(out, j)
+	}
+	return out
+}
