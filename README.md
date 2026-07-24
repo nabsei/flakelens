@@ -1,5 +1,7 @@
 # flakelens
 
+[![CI](https://github.com/nabsei/flakelens/actions/workflows/ci.yml/badge.svg)](https://github.com/nabsei/flakelens/actions/workflows/ci.yml)
+
 Find flaky (not broken) CI jobs from the GitHub Actions history a repo
 already has. No rerun, no test-report artifact, no config.
 
