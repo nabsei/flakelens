@@ -4,15 +4,19 @@ Find flaky (not broken) CI jobs from the GitHub Actions history a repo
 already has — no rerun, no test-report artifact, no config.
 
 ```
-$ GITHUB_TOKEN=$(gh auth token) flakelens rust-lang/rust-analyzer
+$ GITHUB_TOKEN=$(gh auth token) flakelens denoland/deno
 Jobs that failed in isolation (siblings in the same run passed) on 2+ distinct branches/occasions:
 
-- proc-macro-srv: 4 isolated failures (3 distinct occurrences)
-    commit 6099dec4, branch fix-postfix-err-completion, https://github.com/rust-lang/rust-analyzer/actions/runs/29816168986
-    commit 3e9ed375, branch fix-postfix-err-completion, https://github.com/rust-lang/rust-analyzer/actions/runs/29814823463
-    commit 756aac72, branch fix_assertion, https://github.com/rust-lang/rust-analyzer/actions/runs/29808269098
-    commit e7f67080, branch feat/ungrammar-no-std-support, https://github.com/rust-lang/rust-analyzer/actions/runs/29807621521
+- test specs (1/2) debug linux-aarch64: 2 isolated failures (2 distinct occurrences)
+    commit 562ff5c8, branch main, https://github.com/denoland/deno/actions/runs/30050862308
+    commit 39c22a20, branch main, https://github.com/denoland/deno/actions/runs/30036918944
 ```
+
+Both runs above are unrelated merges to `main` (one an HTTP stream fix, one
+an FFI fix) — yet both fail on the exact same test,
+`specs::upgrade::stable`, confirmed by reading each run's log. Two unrelated
+PRs, same test breaking in isolation both times: that's the signal this tool
+is built to find.
 
 ## Install
 
