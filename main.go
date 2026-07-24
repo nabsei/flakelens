@@ -55,6 +55,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -62,6 +63,10 @@ import (
 
 	"github.com/google/go-github/v66/github"
 )
+
+// githubPerPageMax is GitHub's hard cap on the per_page query parameter;
+// requesting more just gets silently clamped to this by the API.
+const githubPerPageMax = 100
 
 // maxCoFailures: a failing job counts as "isolated" (not explained by a
 // broad, correlated failure) only when at most this many *other* jobs in the
@@ -112,23 +117,39 @@ func run(ownerRepo string, rest []string) error {
 
 	repoInfo, _, err := client.Repositories.Get(ctx, owner, repo)
 	if err != nil {
-		return fmt.Errorf("looking up default branch: %w", err)
+		return friendlyError(err, ownerRepo)
 	}
 	defaultBranch := repoInfo.GetDefaultBranch()
 
-	runsResp, _, err := client.Actions.ListRepositoryWorkflowRuns(ctx, owner, repo, &github.ListWorkflowRunsOptions{
+	var runs []*github.WorkflowRun
+	opts := &github.ListWorkflowRunsOptions{
 		Status:      "completed",
-		ListOptions: github.ListOptions{PerPage: maxRuns},
-	})
-	if err != nil {
-		return fmt.Errorf("listing workflow runs: %w", err)
+		ListOptions: github.ListOptions{PerPage: githubPerPageMax},
+	}
+	for len(runs) < maxRuns {
+		runsResp, resp, err := client.Actions.ListRepositoryWorkflowRuns(ctx, owner, repo, opts)
+		if err != nil {
+			return friendlyError(err, ownerRepo)
+		}
+		runs = append(runs, runsResp.WorkflowRuns...)
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	if len(runs) > maxRuns {
+		runs = runs[:maxRuns]
 	}
 
 	byJob := make(map[string][]isolatedFailure)
 
-	for _, wr := range runsResp.WorkflowRuns {
+	for _, wr := range runs {
 		jobsResp, _, err := client.Actions.ListWorkflowJobs(ctx, owner, repo, wr.GetID(), nil)
 		if err != nil {
+			var rateErr *github.RateLimitError
+			if errors.As(err, &rateErr) {
+				return friendlyError(err, ownerRepo)
+			}
 			fmt.Fprintf(os.Stderr, "flakelens: warning: skipping run %d: %v\n", wr.GetID(), err)
 			continue
 		}
@@ -187,6 +208,21 @@ func run(ownerRepo string, rest []string) error {
 		}
 	}
 	return nil
+}
+
+// friendlyError turns GitHub's rate-limit error into an actionable message.
+// Unauthenticated requests get 60/hour, which a single run of flakelens on
+// an active repo can burn through in one shot (one call per workflow run
+// examined); an authenticated token raises that to 5000/hour.
+func friendlyError(err error, ownerRepo string) error {
+	var rateErr *github.RateLimitError
+	if errors.As(err, &rateErr) {
+		if os.Getenv("GITHUB_TOKEN") == "" {
+			return fmt.Errorf("GitHub API rate limit hit (unauthenticated requests are capped at 60/hour): set GITHUB_TOKEN to raise this to 5000/hour, e.g. GITHUB_TOKEN=$(gh auth token) flakelens %s", ownerRepo)
+		}
+		return fmt.Errorf("GitHub API rate limit hit even with GITHUB_TOKEN set: %w", err)
+	}
+	return err
 }
 
 func min(a, b int) int {
