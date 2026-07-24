@@ -1,4 +1,4 @@
-// flakelens finds jobs that are flaky — not broken — by reading GitHub
+// flakelens finds jobs that are flaky, not broken, by reading GitHub
 // Actions history a repo already has, no rerun or test-report artifact
 // required.
 //
@@ -6,32 +6,32 @@
 // so a genuine code problem (a real compile error, a real lint violation)
 // tends to fail most or all jobs in that run together. A job that fails
 // *alone*, while its sibling jobs in the same run pass, is not explained by
-// "the code was broken" — it's isolated, and isolated, repeated failures are
+// "the code was broken." It's isolated, and isolated, repeated failures are
 // exactly what flaky (non-deterministic) jobs look like.
 //
 // This was chosen after two rejected mechanisms, verified empirically against
 // rust-lang/rust-analyzer before writing this: (1) explicit reruns
-// (run_attempt > 1) are too rare to find in a practical history window —
+// (run_attempt > 1) are too rare to find in a practical history window,
 // nobody clicks "re-run failed jobs" often enough; (2) per-job raw failure
-// rate alone is misleading — several jobs can share the same failure rate
+// rate alone is misleading, several jobs can share the same failure rate
 // because they all failed together on the same handful of genuinely broken
 // runs, which isolated-failure counting correctly excludes.
 //
 // A third gap surfaced by testing against denoland/deno: a PR branch can fail
-// the same isolated job twice in a row for a perfectly deterministic reason —
-// the author is mid-debugging still-broken new code (observed: a new musl
+// the same isolated job twice in a row for a perfectly deterministic reason.
+// The author is mid-debugging still-broken new code (observed: a new musl
 // build target failing on the same toolchain relocation error across two
 // pushes to the same PR). That looks identical to flakiness under "isolated +
 // repeated". The first fix tried (drop all pull_request-event runs) was too
 // blunt: re-testing against rust-lang/rust-analyzer showed the original
 // proc-macro-srv signal came from four *different* PR branches by different
-// authors — excluding PR runs entirely threw that away, even though
+// authors. Excluding PR runs entirely threw that away, even though
 // cross-branch repetition is if anything a stronger flakiness signal than a
 // post-merge repeat (master/main is reused forever, so "same branch" can't be
 // used to distinguish repeat merges from a single in-progress PR there).
 //
 // The actual discriminator is "same branch, still being iterated on" vs.
-// "different branches/commits, unrelated to each other" — not PR-vs-push.
+// "different branches/commits, unrelated to each other," not PR-vs-push.
 // Repeated isolated failures on the *same* non-default branch collapse to one
 // occurrence (presumptively the same still-broken code, not flakiness);
 // failures on the default branch always count individually, since a rerun of
@@ -48,10 +48,10 @@
 // Mitigated, not solved: for jobs that clear the isolated-failure threshold,
 // flakelens now downloads each occurrence's log and tries to extract the
 // actual failing test name (a handful of regexes covering pytest, cargo
-// test, and go test — not a real parser per framework, which is the bigger
+// test, and go test, not a real parser per framework, which is the bigger
 // "adapter" cost buildline deliberately took on and this deliberately
 // hasn't). If the extracted names disagree across occurrences, the job is
-// dropped — that's the polars case, not flakiness. If a name can't be
+// dropped, that's the polars case, not flakiness. If a name can't be
 // extracted at all (unrecognized log format), the finding is kept but
 // labeled UNVERIFIED rather than presented at the same confidence as a
 // confirmed match. This is best-effort pattern matching, not a real parser:
@@ -84,9 +84,9 @@ const githubPerPageMax = 100
 // clearly failed alongside a real, broad breakage.
 const maxCoFailures = 0
 
-// minIsolatedFailures: report a job only once it has failed in isolation this
-// many times — one isolated failure could still be a one-off; a repeated
-// pattern is what makes it a flakiness candidate rather than noise.
+// minIsolatedFailures: report a job only once it has failed in isolation
+// this many times. One isolated failure could still be a one-off; a
+// repeated pattern is what makes it a flakiness candidate rather than noise.
 const minIsolatedFailures = 2
 
 type isolatedFailure struct {
@@ -219,7 +219,7 @@ func run(ownerRepo string, rest []string) error {
 		for i, f := range r.failures {
 			testName := ""
 			if i < len(testNames) && testNames[i] != "" {
-				testName = " — " + testNames[i]
+				testName = " (" + testNames[i] + ")"
 			}
 			fmt.Printf("    commit %s, branch %s, https://github.com/%s/%s/actions/runs/%d%s\n",
 				f.headSHA[:min(8, len(f.headSHA))], f.branch, owner, repo, f.runID, testName)
@@ -234,10 +234,10 @@ func run(ownerRepo string, rest []string) error {
 // per-occurrence test names (same order/length as the input, empty string
 // where extraction failed) so the caller can print them alongside each run.
 //
-//   - CONFIRMED: <name>   — every occurrence where a name was found agrees
-//   - REJECTED: different tests failed (<name a> vs <name b>) — likely not
+//   - CONFIRMED: <name>, every occurrence where a name was found agrees
+//   - REJECTED: different tests failed (<name a> vs <name b>), likely not
 //     flakiness, likely the "monolithic test suite" job-granularity problem
-//   - UNVERIFIED — couldn't extract a test name from any occurrence's log;
+//   - UNVERIFIED, couldn't extract a test name from any occurrence's log;
 //     the job-name-level correlation still stands, just unconfirmed
 func verifyAgainstLogs(ctx context.Context, client *github.Client, httpClient *http.Client, owner, repo string, failures []isolatedFailure) (verdict string, testNames []string) {
 	testNames = make([]string, len(failures))
@@ -260,9 +260,9 @@ func verifyAgainstLogs(ctx context.Context, client *github.Client, httpClient *h
 // encode/httpx): GitHub only retains job logs for a limited window (90 days
 // by default), so by the time an isolated-failure candidate is old enough to
 // have accumulated multiple occurrences, several of those occurrences' logs
-// may have already expired — leaving only one or two readable out of many.
+// may have already expired, leaving only one or two readable out of many.
 // Agreement across 1 readable log out of 8 is real, but much weaker evidence
-// than agreement across, say, 2 out of 2 — the verdict says so explicitly
+// than agreement across, say, 2 out of 2. The verdict says so explicitly
 // rather than presenting both as equally "CONFIRMED."
 func verdictFromTestNames(testNames []string) string {
 	found := map[string]bool{}
@@ -283,7 +283,7 @@ func verdictFromTestNames(testNames []string) string {
 			name = n
 		}
 		if readable == 1 {
-			return fmt.Sprintf("CONFIRMED (weak — only 1/%d logs readable): %s", len(testNames), name)
+			return fmt.Sprintf("CONFIRMED (weak, only 1/%d logs readable): %s", len(testNames), name)
 		}
 		return fmt.Sprintf("CONFIRMED (%d/%d logs agree): %s", readable, len(testNames), name)
 	default:
@@ -378,8 +378,8 @@ var aggregatorJobNames = map[string]bool{
 
 // lintJobNamePatterns are substrings of job names (checked case-insensitively)
 // that commonly indicate a deterministic lint/format check: rustfmt, clippy,
-// eslint, prettier, and the like. The core correlation signal — "isolated
-// among its siblings" — assumes siblings are testing the same thing, so a
+// eslint, prettier, and the like. The core correlation signal, "isolated
+// among its siblings," assumes siblings are testing the same thing, so a
 // lone failure is surprising. That assumption breaks for jobs that check
 // something orthogonal to the rest of the matrix: a lint/format job fails or
 // passes based purely on whether that PR's diff satisfies the rule, entirely
@@ -427,17 +427,19 @@ var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;]*m")
 
 // failedTestPatterns extract a failing test's identifier from a cleaned log,
 // tried in order, first match wins. Best-effort coverage of a few common
-// frameworks — see the package doc comment for what this does and doesn't
-// give you.
+// frameworks, see the package doc comment for what this does and doesn't
+// give you. mocha isn't in this list: its failure format needs multi-line
+// scanning a single regex can't express cleanly, so it's handled separately
+// by extractMochaFailedTest below.
 var failedTestPatterns = []*regexp.Regexp{
 	// pytest short summary: "FAILED tests/path/test_x.py::test_name - AssertionError: ..."
-	// Not always present — some pytest configs/versions only print the
+	// Not always present. Some pytest configs/versions only print the
 	// FAILURES section below, not this summary line.
 	regexp.MustCompile(`(?m)^FAILED (\S+)`),
 	// pytest FAILURES section header: "____ test_name[param] ____" (found
 	// testing against encode/httpx, where the short summary line above was
 	// missing from several logs but this header always was present). No file
-	// path in this one, just the bare test name — a weaker identifier than
+	// path in this one, just the bare test name, a weaker identifier than
 	// the short-summary form above (same name possible in two files), which
 	// is why it's tried second, not first.
 	regexp.MustCompile(`(?m)^_{3,}\s+(.+?)\s+_{3,}\s*$`),
@@ -450,6 +452,59 @@ var failedTestPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?m)^--- FAIL: (\S+)`),
 }
 
+// mochaFailureHeader marks the start of one of mocha's numbered failure
+// entries: "  N) <text>". This is ambiguous on its own. Mocha prints it
+// *twice* for the same failure: once inline, live, as each spec runs (e.g.
+// "    1) should expose EventEmitter methods ...", a single flat line, no
+// further breakdown, immediately followed by the next spec's result), and
+// once in the "failing" section at the very end of the run, broken into one
+// line per level of nested describe()/it(), each indented further than the
+// last, only the deepest (the it() title) ending in a colon. That's the one
+// with the useful structure. extractMochaFailedTest has to tell these apart:
+// it tries each numbered-header match in turn and only accepts one that's
+// actually followed by increasing indentation, skipping past inline markers
+// that aren't.
+var mochaFailureHeader = regexp.MustCompile(`^\s*\d+\)\s+\S`)
+
+func indentWidth(line string) int {
+	return len(line) - len(strings.TrimLeft(line, " \t"))
+}
+
+func extractMochaFailedTest(cleaned string) string {
+	lines := strings.Split(cleaned, "\n")
+	for i, line := range lines {
+		if !mochaFailureHeader.MatchString(line) {
+			continue
+		}
+		if name := deepestMochaHeading(lines[i+1:], indentWidth(line)); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// deepestMochaHeading walks lines immediately following a numbered mocha
+// failure header, following strictly increasing indentation, and returns the
+// last (deepest) one, or "" if indentation never increases, meaning this
+// wasn't a real structured failure block (e.g. mocha's inline live-run
+// marker, which has no follow-up lines at all).
+func deepestMochaHeading(lines []string, indent int) string {
+	last := ""
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			break
+		}
+		lineIndent := indentWidth(line)
+		if lineIndent <= indent {
+			break
+		}
+		indent = lineIndent
+		last = strings.TrimSuffix(trimmed, ":")
+	}
+	return last
+}
+
 func extractFailedTestName(log string) string {
 	cleaned := ansiEscape.ReplaceAllString(logLinePrefix.ReplaceAllString(log, ""), "")
 	for _, pattern := range failedTestPatterns {
@@ -457,7 +512,7 @@ func extractFailedTestName(log string) string {
 			return m[1]
 		}
 	}
-	return ""
+	return extractMochaFailedTest(cleaned)
 }
 
 func jobsForCorrelation(jobs []*github.WorkflowJob) []*github.WorkflowJob {

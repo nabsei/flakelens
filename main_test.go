@@ -179,6 +179,37 @@ func TestExtractFailedTestName(t *testing.T) {
 			want: "tests/foo.py::test_bar",
 		},
 		{
+			name: "mocha, real excerpt from socketio/socket.io engine.io middlewares.js, includes both of mocha's two N) formats for the same failure",
+			// mocha prints the failure twice: once inline as each spec runs
+			// (flat, single line, no colon, immediately followed by the next
+			// spec's result, a trap: it also starts with "N) text" and, if
+			// picked, yields nothing useful), and once in the "failing"
+			// section at the end (the real, structured one). Real capture
+			// from a live run of this exact repo/job earlier in this
+			// session, this is what caught the inline-marker bug.
+			log: "2026-07-24T12:37:32.4711221Z   middlewares\n" +
+				"2026-07-24T12:37:32.4779018Z     ✔ should apply middleware (polling)\n" +
+				"2026-07-24T12:37:32.4810880Z     ✔ should apply middleware (websocket)\n" +
+				"2026-07-24T12:37:32.4860418Z     1) should expose EventEmitter methods on the response object during upgrade (regression for pino-http)\n" +
+				"2026-07-24T12:37:32.4886457Z     ✔ should apply all middlewares in order\n" +
+				"2026-07-24T12:37:38.6725050Z   177 passing (7s)\n" +
+				"2026-07-24T12:37:38.6725561Z   18 pending\n" +
+				"2026-07-24T12:37:38.6725864Z   1 failing\n" +
+				"2026-07-24T12:37:38.6729612Z   1) middlewares\n" +
+				"2026-07-24T12:37:38.6730576Z        should expose EventEmitter methods on the response object during upgrade (regression for pino-http):\n" +
+				"2026-07-24T12:37:38.6731679Z      Uncaught Error: expected undefined to be a function\n" +
+				"2026-07-24T12:37:38.6734549Z       at Assertion.assert (/home/runner/work/socket.io/socket.io/node_modules/expect.js/index.js:96:13)\n",
+			want: "should expose EventEmitter methods on the response object during upgrade (regression for pino-http)",
+		},
+		{
+			name: "mocha with a nested describe: the deepest heading line wins, not the outer suite (only the it() title gets a colon, not the intermediate describe())",
+			log: "2026-07-24T00:00:00.0000000Z   1) Outer suite\n" +
+				"2026-07-24T00:00:00.0000000Z        Inner suite\n" +
+				"2026-07-24T00:00:00.0000000Z          should do the specific thing:\n" +
+				"2026-07-24T00:00:00.0000000Z      AssertionError: expected 1 to equal 2\n",
+			want: "should do the specific thing",
+		},
+		{
 			name: "unrecognized format yields no match",
 			log:  "2026-07-24T00:00:00.0000000Z Build failed with exit code 1\n",
 			want: "",
@@ -218,12 +249,12 @@ func TestVerdictFromTestNames(t *testing.T) {
 		{
 			name:      "one extracted, one blank: still confirms on the one we have, but flagged weak",
 			testNames: []string{"specs::upgrade::stable", ""},
-			wantHas:   "CONFIRMED (weak — only 1/2 logs readable): specs::upgrade::stable",
+			wantHas:   "CONFIRMED (weak, only 1/2 logs readable): specs::upgrade::stable",
 		},
 		{
 			name:      "one readable out of many, like the httpx Python 3.12 case (1/8 logs readable, rest expired)",
 			testNames: []string{"test_write_timeout[trio]", "", "", "", "", "", "", ""},
-			wantHas:   "CONFIRMED (weak — only 1/8 logs readable): test_write_timeout[trio]",
+			wantHas:   "CONFIRMED (weak, only 1/8 logs readable): test_write_timeout[trio]",
 		},
 		{
 			name:      "several agree, one blank: strong confirmation, not weak",
