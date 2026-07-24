@@ -80,3 +80,50 @@ func TestJobsForCorrelationExcludesAggregators(t *testing.T) {
 		}
 	}
 }
+
+func TestJobsForCorrelationExcludesLintJobs(t *testing.T) {
+	jobs := []*github.WorkflowJob{
+		{Name: github.String("build")},
+		{Name: github.String("rustfmt")},
+		{Name: github.String("clippy")},
+		{Name: github.String("Rust (macos-latest)")},
+		{Name: github.String("lint")},
+		{Name: github.String("eslint")},
+	}
+
+	got := jobsForCorrelation(jobs)
+
+	if len(got) != 2 {
+		names := make([]string, len(got))
+		for i, j := range got {
+			names[i] = j.GetName()
+		}
+		t.Fatalf("expected 2 non-lint jobs, got %d: %v", len(got), names)
+	}
+	for _, j := range got {
+		if looksLikeLintJob(j.GetName()) {
+			t.Errorf("lint job %q should have been excluded", j.GetName())
+		}
+	}
+}
+
+func TestLooksLikeLintJob(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"rustfmt", true},
+		{"clippy", true},
+		{"eslint", true},
+		{"Prettier Check", true},
+		{"golangci-lint", true},
+		{"Rust (ubuntu-latest)", false},
+		{"proc-macro-srv", false},
+		{"coverage-python", false},
+	}
+	for _, tt := range tests {
+		if got := looksLikeLintJob(tt.name); got != tt.want {
+			t.Errorf("looksLikeLintJob(%q) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}

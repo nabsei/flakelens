@@ -264,10 +264,48 @@ var aggregatorJobNames = map[string]bool{
 	"success":         true,
 }
 
+// lintJobNamePatterns are substrings of job names (checked case-insensitively)
+// that commonly indicate a deterministic lint/format check: rustfmt, clippy,
+// eslint, prettier, and the like. The core correlation signal — "isolated
+// among its siblings" — assumes siblings are testing the same thing, so a
+// lone failure is surprising. That assumption breaks for jobs that check
+// something orthogonal to the rest of the matrix: a lint/format job fails or
+// passes based purely on whether that PR's diff satisfies the rule, entirely
+// independent of whether the build/test jobs pass. Found by reporting
+// rust-analyzer's rustfmt as a flakiness candidate and being correctly told
+// by a maintainer it was "expected to fail without relation to other jobs
+// since they just check other things":
+// https://github.com/rust-lang/rust-analyzer/issues/22904
+var lintJobNamePatterns = []string{
+	"fmt",
+	"format",
+	"lint",
+	"clippy",
+	"prettier",
+	"eslint",
+	"checkstyle",
+	"stylelint",
+	"rubocop",
+	"flake8",
+	"ruff",
+	"black",
+	"shellcheck",
+}
+
+func looksLikeLintJob(name string) bool {
+	lower := strings.ToLower(name)
+	for _, pattern := range lintJobNamePatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 func jobsForCorrelation(jobs []*github.WorkflowJob) []*github.WorkflowJob {
 	out := make([]*github.WorkflowJob, 0, len(jobs))
 	for _, j := range jobs {
-		if aggregatorJobNames[j.GetName()] {
+		if aggregatorJobNames[j.GetName()] || looksLikeLintJob(j.GetName()) {
 			continue
 		}
 		out = append(out, j)
