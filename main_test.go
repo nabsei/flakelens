@@ -143,6 +143,17 @@ func TestExtractFailedTestName(t *testing.T) {
 			want: "tests/unit/operations/namespaces/temporal/test_to_datetime.py::test_to_datetime",
 		},
 		{
+			name: "pytest FAILURES header only, real excerpt from encode/httpx (no short-summary FAILED line present)",
+			log: "2026-05-20T16:27:47.6470576Z tests/test_wsgi.py ............                                          [100%]\n" +
+				"2026-05-20T16:27:47.6471278Z =================================== FAILURES ===================================\n" +
+				"2026-05-20T16:27:47.6472319Z ___________________________ test_write_timeout[trio] ___________________________\n" +
+				"2026-05-20T16:27:47.6472598Z\n" +
+				"2026-05-20T16:27:47.6512674Z =========================== short test summary info ============================\n" +
+				"2026-05-20T16:27:47.6513178Z SKIPPED [1] tests/client/test_auth.py:273: reason\n" +
+				"2026-05-20T16:27:47.6513709Z ================== 1 failed, 1416 passed, 1 skipped in 18.37s ==================\n",
+			want: "test_write_timeout[trio]",
+		},
+		{
 			name: "cargo test via file_test_runner, real excerpt from denoland/deno",
 			log: "2026-07-23T22:59:01.9654556Z panicked at tests/specs/mod.rs:664:12:\n" +
 				"2026-07-23T22:59:01.9654842Z pattern match failed\n" +
@@ -192,7 +203,7 @@ func TestVerdictFromTestNames(t *testing.T) {
 		{
 			name:      "all occurrences agree on the same test",
 			testNames: []string{"specs::upgrade::stable", "specs::upgrade::stable"},
-			wantHas:   "CONFIRMED: specs::upgrade::stable",
+			wantHas:   "CONFIRMED (2/2 logs agree): specs::upgrade::stable",
 		},
 		{
 			name:      "occurrences disagree, like the polars coverage-python case",
@@ -205,9 +216,19 @@ func TestVerdictFromTestNames(t *testing.T) {
 			wantHas:   "UNVERIFIED",
 		},
 		{
-			name:      "one extracted, one blank, still confirms on the one we have",
+			name:      "one extracted, one blank: still confirms on the one we have, but flagged weak",
 			testNames: []string{"specs::upgrade::stable", ""},
-			wantHas:   "CONFIRMED: specs::upgrade::stable",
+			wantHas:   "CONFIRMED (weak — only 1/2 logs readable): specs::upgrade::stable",
+		},
+		{
+			name:      "one readable out of many, like the httpx Python 3.12 case (1/8 logs readable, rest expired)",
+			testNames: []string{"test_write_timeout[trio]", "", "", "", "", "", "", ""},
+			wantHas:   "CONFIRMED (weak — only 1/8 logs readable): test_write_timeout[trio]",
+		},
+		{
+			name:      "several agree, one blank: strong confirmation, not weak",
+			testNames: []string{"foo::bar", "foo::bar", "foo::bar", ""},
+			wantHas:   "CONFIRMED (3/4 logs agree): foo::bar",
 		},
 	}
 

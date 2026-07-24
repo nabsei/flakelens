@@ -255,11 +255,22 @@ func verifyAgainstLogs(ctx context.Context, client *github.Client, httpClient *h
 // split out so it can be unit tested without downloading anything: given the
 // (possibly partially empty) list of test names extracted per occurrence, it
 // decides whether the occurrences agree, disagree, or yielded nothing usable.
+//
+// A common failure mode this has to account for (found testing against
+// encode/httpx): GitHub only retains job logs for a limited window (90 days
+// by default), so by the time an isolated-failure candidate is old enough to
+// have accumulated multiple occurrences, several of those occurrences' logs
+// may have already expired — leaving only one or two readable out of many.
+// Agreement across 1 readable log out of 8 is real, but much weaker evidence
+// than agreement across, say, 2 out of 2 — the verdict says so explicitly
+// rather than presenting both as equally "CONFIRMED."
 func verdictFromTestNames(testNames []string) string {
 	found := map[string]bool{}
+	readable := 0
 	for _, name := range testNames {
 		if name != "" {
 			found[name] = true
+			readable++
 		}
 	}
 
@@ -271,7 +282,10 @@ func verdictFromTestNames(testNames []string) string {
 		for n := range found {
 			name = n
 		}
-		return "CONFIRMED: " + name
+		if readable == 1 {
+			return fmt.Sprintf("CONFIRMED (weak — only 1/%d logs readable): %s", len(testNames), name)
+		}
+		return fmt.Sprintf("CONFIRMED (%d/%d logs agree): %s", readable, len(testNames), name)
 	default:
 		names := make([]string, 0, len(found))
 		for n := range found {
@@ -416,8 +430,17 @@ var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;]*m")
 // frameworks — see the package doc comment for what this does and doesn't
 // give you.
 var failedTestPatterns = []*regexp.Regexp{
-	// pytest: "FAILED tests/path/test_x.py::test_name - AssertionError: ..."
+	// pytest short summary: "FAILED tests/path/test_x.py::test_name - AssertionError: ..."
+	// Not always present — some pytest configs/versions only print the
+	// FAILURES section below, not this summary line.
 	regexp.MustCompile(`(?m)^FAILED (\S+)`),
+	// pytest FAILURES section header: "____ test_name[param] ____" (found
+	// testing against encode/httpx, where the short summary line above was
+	// missing from several logs but this header always was present). No file
+	// path in this one, just the bare test name — a weaker identifier than
+	// the short-summary form above (same name possible in two files), which
+	// is why it's tried second, not first.
+	regexp.MustCompile(`(?m)^_{3,}\s+(.+?)\s+_{3,}\s*$`),
 	// cargo test via file_test_runner (used by e.g. deno's specs tests):
 	// "failed tests:\n    specs::upgrade::stable"
 	regexp.MustCompile(`(?m)^failed tests:\r?\n\s+(\S+)`),

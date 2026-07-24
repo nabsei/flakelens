@@ -7,7 +7,7 @@ already has — no rerun, no test-report artifact, no config.
 $ GITHUB_TOKEN=$(gh auth token) flakelens denoland/deno
 Jobs that failed in isolation (siblings in the same run passed) on 2+ distinct branches/occasions:
 
-- test specs (1/2) debug linux-aarch64: 2 isolated failures (2 distinct occurrences) [CONFIRMED: specs::upgrade::stable]
+- test specs (1/2) debug linux-aarch64: 2 isolated failures (2 distinct occurrences) [CONFIRMED (2/2 logs agree): specs::upgrade::stable]
     commit 562ff5c8, branch main, https://github.com/denoland/deno/actions/runs/30050862308 — specs::upgrade::stable
     commit 39c22a20, branch main, https://github.com/denoland/deno/actions/runs/30036918944 — specs::upgrade::stable
 ```
@@ -72,8 +72,15 @@ downloads each occurrence's log and tries to extract the actual test that
 failed (pytest, `cargo test`, and `go test` output formats — a handful of
 regexes, not a real parser per framework). The result is tagged:
 
-- **`CONFIRMED: <test>`** — every occurrence where a test name could be read
-  failed on the *same* test. Strong signal.
+- **`CONFIRMED (N/M logs agree): <test>`** — every occurrence whose log was
+  readable failed on the *same* test. `N` is how many logs actually yielded
+  a name out of `M` total occurrences — GitHub only keeps job logs for a
+  limited window (90 days by default), so on an older finding it's common
+  for most occurrences' logs to have already expired by the time flakelens
+  gets to them. When only one log was left to read, that's flagged
+  explicitly as **`CONFIRMED (weak — only 1/M logs readable): <test>`**
+  rather than presented with the same confidence as, say, 2/2 — agreement
+  with nothing else to compare against is real but much thinner evidence.
 - **`REJECTED: different tests failed (...)`** — the occurrences disagree.
   This is what a monolithic "run everything" job repeating under this
   correlation usually means: two unrelated PRs each broke one unrelated test
@@ -85,8 +92,9 @@ regexes, not a real parser per framework). The result is tagged:
       tests/unit/io/test_iceberg.py::test_scan_iceberg_parquet_prefilter_with_column_mapping vs
       tests/unit/operations/namespaces/temporal/test_to_datetime.py::test_to_datetime)]
   ```
-- **`UNVERIFIED`** — no occurrence's log matched a known format. The
-  job-level correlation still stands, it's just not confirmed against logs.
+- **`UNVERIFIED`** — no occurrence's log yielded a name at all (unrecognized
+  format, or every log had already expired). The job-level correlation still
+  stands, it's just not confirmed against logs.
 
 Full reasoning, including two mechanisms that were tried and rejected, is in
 the doc comment at the top of `main.go`.
@@ -114,9 +122,18 @@ the doc comment at the top of `main.go`.
   real bugs sharing a job name (`REJECTED`), and confirms when it's really
   the same test breaking (`CONFIRMED`). But it's regex pattern-matching
   against a handful of frameworks, not a real parser: a framework it doesn't
-  recognize, a log GitHub has already expired, or multiple simultaneous test
-  failures in one job (only the first found is used) can all still produce
-  `UNVERIFIED` — at that point you're back to reading the log yourself.
+  recognize, or multiple simultaneous test failures in one job (only the
+  first found is used), can still produce `UNVERIFIED` — at that point
+  you're back to reading the log yourself.
+- **Old findings can't always be verified — GitHub deletes job logs after 90
+  days.** The isolated-failure correlation looks back over ordinary run
+  history, which can easily span months on an active repo; log verification
+  can only work on whatever hasn't expired yet. Found testing against
+  `encode/httpx`: a job with 8 isolated occurrences going back roughly a
+  year came back `CONFIRMED (weak — only 1/8 logs readable)` — only the most
+  recent occurrence's log was still there to read. That one confirmation is
+  real, but it isn't the strong "N separate reads all agree" signal a fresher
+  finding would give you.
 - **Aggregator/gate jobs are excluded by a name denylist** (`conclusion`,
   `all-green`, `ci-success`, `required-checks`, `success`), not by reading
   each job's actual `needs` graph. A repo using a differently-named gate job
