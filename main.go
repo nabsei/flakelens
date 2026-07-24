@@ -37,27 +37,36 @@
 // failures on the default branch always count individually, since a rerun of
 // "master" is never a rerun of the same in-progress fix.
 //
-// KNOWN LIMITATION (found testing against pola-rs/polars, not fixed): this
-// tool operates at job granularity, but a job can be a monolithic test suite
-// (e.g. "coverage-python" running ~35k tests). Two unrelated PRs each
-// breaking one unrelated test of their own (observed: a temporal-handling PR
-// failing a datetime test, a parquet-filter PR failing an iceberg/parquet
-// test) get counted as the same job repeating, even though they're two
-// different real bugs in two different tests that just happen to share a job
-// name. Fixing this needs the actual failing test name pulled from each job's
-// log, which requires a parser per test framework (pytest, cargo test, go
-// test, ...) — the same per-ecosystem "adapter" cost buildline deliberately
-// took on, and deliberately not taken on here yet. Until then: trust this
-// tool most on repos with narrow, single-purpose jobs (one target, one lint,
-// one binary); treat a hit on a whole-suite job as a lead to click through
-// and read, not a verdict.
+// A fifth gap, found the same way (testing against pola-rs/polars): this tool
+// operates at job granularity, but a job can be a monolithic test suite (e.g.
+// "coverage-python" running ~35k tests). Two unrelated PRs each breaking one
+// unrelated test of their own (observed: a temporal-handling PR failing a
+// datetime test, a parquet-filter PR failing an iceberg/parquet test) get
+// counted as the same job repeating, even though they're two different real
+// bugs in two different tests that just happen to share a job name.
+//
+// Mitigated, not solved: for jobs that clear the isolated-failure threshold,
+// flakelens now downloads each occurrence's log and tries to extract the
+// actual failing test name (a handful of regexes covering pytest, cargo
+// test, and go test — not a real parser per framework, which is the bigger
+// "adapter" cost buildline deliberately took on and this deliberately
+// hasn't). If the extracted names disagree across occurrences, the job is
+// dropped — that's the polars case, not flakiness. If a name can't be
+// extracted at all (unrecognized log format), the finding is kept but
+// labeled UNVERIFIED rather than presented at the same confidence as a
+// confirmed match. This is best-effort pattern matching, not a real parser:
+// it will miss test frameworks it doesn't recognize, and a job with multiple
+// simultaneous test failures only looks at the first one found in the log.
 package main
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -82,6 +91,7 @@ const minIsolatedFailures = 2
 
 type isolatedFailure struct {
 	runID   int64
+	jobID   int64
 	headSHA string
 	branch  string
 }
@@ -176,6 +186,7 @@ func run(ownerRepo string, rest []string) error {
 			name := j.GetName()
 			byJob[name] = append(byJob[name], isolatedFailure{
 				runID:   wr.GetID(),
+				jobID:   j.GetID(),
 				headSHA: wr.GetHeadSHA(),
 				branch:  wr.GetHeadBranch(),
 			})
@@ -198,16 +209,103 @@ func run(ownerRepo string, rest []string) error {
 		fmt.Println("No jobs with repeated isolated failures found in the observed run history.")
 		return nil
 	}
+
+	httpClient := &http.Client{}
 	fmt.Printf("Jobs that failed in isolation (siblings in the same run passed) on %d+ distinct branches/occasions:\n\n", minIsolatedFailures)
 	for _, r := range results {
-		fmt.Printf("- %s: %d isolated failures (%d distinct occurrences)\n",
-			r.name, len(r.failures), countDistinctOccurrences(r.failures, defaultBranch))
-		for _, f := range r.failures {
-			fmt.Printf("    commit %s, branch %s, https://github.com/%s/%s/actions/runs/%d\n",
-				f.headSHA[:min(8, len(f.headSHA))], f.branch, owner, repo, f.runID)
+		verdict, testNames := verifyAgainstLogs(ctx, client, httpClient, owner, repo, r.failures)
+		fmt.Printf("- %s: %d isolated failures (%d distinct occurrences) [%s]\n",
+			r.name, len(r.failures), countDistinctOccurrences(r.failures, defaultBranch), verdict)
+		for i, f := range r.failures {
+			testName := ""
+			if i < len(testNames) && testNames[i] != "" {
+				testName = " — " + testNames[i]
+			}
+			fmt.Printf("    commit %s, branch %s, https://github.com/%s/%s/actions/runs/%d%s\n",
+				f.headSHA[:min(8, len(f.headSHA))], f.branch, owner, repo, f.runID, testName)
 		}
 	}
 	return nil
+}
+
+// verifyAgainstLogs downloads the log for each occurrence and tries to
+// extract the actual failing test name (see the pattern list on
+// failedTestPatterns). It returns a human-readable verdict plus the
+// per-occurrence test names (same order/length as the input, empty string
+// where extraction failed) so the caller can print them alongside each run.
+//
+//   - CONFIRMED: <name>   — every occurrence where a name was found agrees
+//   - REJECTED: different tests failed (<name a> vs <name b>) — likely not
+//     flakiness, likely the "monolithic test suite" job-granularity problem
+//   - UNVERIFIED — couldn't extract a test name from any occurrence's log;
+//     the job-name-level correlation still stands, just unconfirmed
+func verifyAgainstLogs(ctx context.Context, client *github.Client, httpClient *http.Client, owner, repo string, failures []isolatedFailure) (verdict string, testNames []string) {
+	testNames = make([]string, len(failures))
+	for i, f := range failures {
+		name, err := fetchFailedTestName(ctx, client, httpClient, owner, repo, f.jobID)
+		if err != nil {
+			continue // log unavailable or unreadable; leave this occurrence blank
+		}
+		testNames[i] = name
+	}
+	return verdictFromTestNames(testNames), testNames
+}
+
+// verdictFromTestNames is the pure decision logic behind verifyAgainstLogs,
+// split out so it can be unit tested without downloading anything: given the
+// (possibly partially empty) list of test names extracted per occurrence, it
+// decides whether the occurrences agree, disagree, or yielded nothing usable.
+func verdictFromTestNames(testNames []string) string {
+	found := map[string]bool{}
+	for _, name := range testNames {
+		if name != "" {
+			found[name] = true
+		}
+	}
+
+	switch len(found) {
+	case 0:
+		return "UNVERIFIED"
+	case 1:
+		var name string
+		for n := range found {
+			name = n
+		}
+		return "CONFIRMED: " + name
+	default:
+		names := make([]string, 0, len(found))
+		for n := range found {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		return "REJECTED: different tests failed (" + strings.Join(names, " vs ") + ")"
+	}
+}
+
+func fetchFailedTestName(ctx context.Context, client *github.Client, httpClient *http.Client, owner, repo string, jobID int64) (string, error) {
+	logURL, _, err := client.Actions.GetWorkflowJobLogs(ctx, owner, repo, jobID, 0)
+	if err != nil {
+		return "", fmt.Errorf("getting log URL: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, logURL.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("downloading log: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("downloading log: unexpected status %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return extractFailedTestName(string(body)), nil
 }
 
 // friendlyError turns GitHub's rate-limit error into an actionable message.
@@ -300,6 +398,43 @@ func looksLikeLintJob(name string) bool {
 		}
 	}
 	return false
+}
+
+// logLinePrefix strips the "<ISO8601 timestamp> " GitHub Actions prefixes
+// every raw log line with, so the patterns below can match log content
+// starting at the beginning of a line rather than after a variable-length
+// timestamp.
+var logLinePrefix = regexp.MustCompile(`(?m)^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z `)
+
+// ansiEscape strips terminal color codes, which several test runners emit
+// even in non-interactive CI logs and which would otherwise sit between a
+// matched keyword and the test name.
+var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+// failedTestPatterns extract a failing test's identifier from a cleaned log,
+// tried in order, first match wins. Best-effort coverage of a few common
+// frameworks — see the package doc comment for what this does and doesn't
+// give you.
+var failedTestPatterns = []*regexp.Regexp{
+	// pytest: "FAILED tests/path/test_x.py::test_name - AssertionError: ..."
+	regexp.MustCompile(`(?m)^FAILED (\S+)`),
+	// cargo test via file_test_runner (used by e.g. deno's specs tests):
+	// "failed tests:\n    specs::upgrade::stable"
+	regexp.MustCompile(`(?m)^failed tests:\r?\n\s+(\S+)`),
+	// plain `cargo test` / rustc's built-in harness: "test some::name ... FAILED"
+	regexp.MustCompile(`(?m)^test (\S+) \.\.\. FAILED`),
+	// go test: "--- FAIL: TestName"
+	regexp.MustCompile(`(?m)^--- FAIL: (\S+)`),
+}
+
+func extractFailedTestName(log string) string {
+	cleaned := ansiEscape.ReplaceAllString(logLinePrefix.ReplaceAllString(log, ""), "")
+	for _, pattern := range failedTestPatterns {
+		if m := pattern.FindStringSubmatch(cleaned); m != nil {
+			return m[1]
+		}
+	}
+	return ""
 }
 
 func jobsForCorrelation(jobs []*github.WorkflowJob) []*github.WorkflowJob {
