@@ -95,9 +95,17 @@ framework). The result is tagged:
       tests/unit/io/test_iceberg.py::test_scan_iceberg_parquet_prefilter_with_column_mapping vs
       tests/unit/operations/namespaces/temporal/test_to_datetime.py::test_to_datetime)]
   ```
-- **`UNVERIFIED`**: no occurrence's log yielded a name at all (unrecognized
-  format, or every log had already expired). The job-level correlation still
-  stands, it's just not confirmed against logs.
+- **`LIKELY (similar failure text, no recognized test-name format)`**: no
+  exact test name could be extracted from any occurrence (the framework
+  isn't one of the four above), but the raw failure text around each
+  occurrence's error is similar enough (word-overlap comparison, every pair
+  above the threshold) to suggest the same underlying failure. Weaker than
+  `CONFIRMED`, since it's comparing prose rather than a structured
+  identifier, but still real evidence, not silence.
+- **`UNVERIFIED`**: no occurrence's log yielded a name, and the failure text
+  isn't similar enough either (unrecognized format and dissimilar text, or
+  every log had already expired). The job-level correlation still stands,
+  it's just not confirmed against logs.
 
 Full reasoning, including two mechanisms that were tried and rejected, is in
 the doc comment at the top of `main.go`.
@@ -111,23 +119,25 @@ the doc comment at the top of `main.go`.
   matrix (most obviously: a lint/format check) fails or passes purely based
   on whether that PR's own diff satisfies it, independent of every other
   job. So it will *always* look "isolated" on real, unrelated, deterministic
-  issues in each PR, with zero flakiness involved. Found this the hard way:
-  flakelens reported rust-analyzer's `rustfmt` as a flakiness candidate and
-  was correctly called out by a maintainer.
-  [rust-lang/rust-analyzer#22904](https://github.com/rust-lang/rust-analyzer/issues/22904).
-  Known lint/format job names are now excluded (see `lintJobNamePatterns` in
-  `main.go`), but that's a denylist of common patterns, not a structural
-  understanding of what a job actually tests. Other orthogonal-but-not-lint
-  jobs can still produce the same false signal.
+  issues in each PR, with zero flakiness involved. More generally: a CI job
+  that never fails separately from its siblings is redundant by design, so a
+  well-designed job is *expected* to be capable of failing alone sometimes.
+  Raw job-level isolation alone is weak evidence on any thoughtfully
+  structured CI pipeline. Known lint/format job names are excluded (see
+  `lintJobNamePatterns` in `main.go`), but that's a denylist of common
+  patterns, not a structural understanding of what a job actually tests.
+  This is exactly why log verification below exists, and why `UNVERIFIED`
+  and `LIKELY` results are explicitly weaker categories rather than
+  presented as findings.
 - **Job granularity vs. test granularity, mitigated but not solved.** The
   [log verification](#log-verification) above catches the case where a
   monolithic-suite job's repeated "isolated failure" is really two unrelated
   real bugs sharing a job name (`REJECTED`), and confirms when it's really
-  the same test breaking (`CONFIRMED`). But it's regex pattern-matching
-  against a handful of frameworks, not a real parser: a framework it doesn't
-  recognize, or multiple simultaneous test failures in one job (only the
-  first found is used), can still produce `UNVERIFIED`. At that point
-  you're back to reading the log yourself.
+  the same test breaking (`CONFIRMED`), with a text-similarity fallback
+  (`LIKELY`) for frameworks without a recognized format. But none of this is
+  a real parser: a genuinely novel failure format, or multiple simultaneous
+  test failures in one job (only the first found is used), can still produce
+  `UNVERIFIED`. At that point you're back to reading the log yourself.
 - **Old findings can't always be verified. GitHub deletes job logs after 90
   days.** The isolated-failure correlation looks back over ordinary run
   history, which can easily span months on an active repo. Log verification
@@ -143,7 +153,7 @@ the doc comment at the top of `main.go`.
   won't be recognized and may mask real signal underneath it.
 - No pull request comment / GitHub Action integration yet. This is a
   read-only CLI you run and read.
-- **`CONFIRMED` and `UNVERIFIED` are still leads, not verdicts.** Log
+- **None of `CONFIRMED`, `LIKELY`, or `UNVERIFIED` are verdicts.** Log
   verification raises confidence, it doesn't replace judgment. flakelens
   doesn't know *why* a test failed, only that the same one did, or didn't,
   repeat.

@@ -229,6 +229,7 @@ func TestVerdictFromTestNames(t *testing.T) {
 	tests := []struct {
 		name      string
 		testNames []string
+		snippets  []string
 		wantHas   string // substring the verdict must contain
 	}{
 		{
@@ -242,8 +243,9 @@ func TestVerdictFromTestNames(t *testing.T) {
 			wantHas:   "REJECTED",
 		},
 		{
-			name:      "no log could be parsed",
+			name:      "no log could be parsed and snippets don't overlap",
 			testNames: []string{"", ""},
+			snippets:  []string{"unrelated content here", "something else entirely"},
 			wantHas:   "UNVERIFIED",
 		},
 		{
@@ -261,13 +263,91 @@ func TestVerdictFromTestNames(t *testing.T) {
 			testNames: []string{"foo::bar", "foo::bar", "foo::bar", ""},
 			wantHas:   "CONFIRMED (3/4 logs agree): foo::bar",
 		},
+		{
+			name:      "no exact test name anywhere, but failure text is similar: falls back to LIKELY",
+			testNames: []string{"", ""},
+			snippets: []string{
+				"AssertionError: connection timed out after 30000ms waiting for upgrade handshake",
+				"AssertionError: connection timed out after 30000ms during upgrade handshake step",
+			},
+			wantHas: "LIKELY",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := verdictFromTestNames(tt.testNames); !strings.Contains(got, tt.wantHas) {
+			if got := verdictFromTestNames(tt.testNames, tt.snippets); !strings.Contains(got, tt.wantHas) {
 				t.Errorf("verdictFromTestNames() = %q, want it to contain %q", got, tt.wantHas)
 			}
 		})
+	}
+}
+
+func TestSnippetsLookSimilar(t *testing.T) {
+	tests := []struct {
+		name     string
+		snippets []string
+		want     bool
+	}{
+		{
+			name: "near-identical failure text across two occurrences",
+			snippets: []string{
+				"Error: connection reset by peer while fetching release manifest from update server",
+				"Error: connection reset by peer while downloading release manifest from update server",
+			},
+			want: true,
+		},
+		{
+			name: "unrelated failures, like the polars coverage-python case",
+			snippets: []string{
+				"AssertionError: DataFrames are different (value mismatch for column b_top_by_ca)",
+				"AssertionError: Regex pattern did not match for test_unsupported_subquery_comparisons",
+			},
+			want: false,
+		},
+		{
+			name:     "fewer than two usable snippets",
+			snippets: []string{"only one snippet here", ""},
+			want:     false,
+		},
+		{
+			name: "one similar pair among three: the third breaks it, not just the closest pair",
+			snippets: []string{
+				"Error: connection reset by peer while fetching release manifest",
+				"Error: connection reset by peer while fetching release manifest",
+				"AssertionError: totally unrelated failure in a different test entirely",
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := snippetsLookSimilar(tt.snippets); got != tt.want {
+				t.Errorf("snippetsLookSimilar() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFailureSnippet(t *testing.T) {
+	log := "2026-07-24T00:00:00.0000000Z Downloading dependencies\n" +
+		"2026-07-24T00:00:00.0000000Z Compiling project\n" +
+		"2026-07-24T00:00:00.0000000Z Running tests\n" +
+		"2026-07-24T00:00:00.0000000Z AssertionError: expected 1 to equal 2\n" +
+		"2026-07-24T00:00:00.0000000Z   at line 42\n"
+	cleaned := cleanLog(log)
+	got := failureSnippet(cleaned)
+	if !strings.Contains(got, "AssertionError: expected 1 to equal 2") {
+		t.Errorf("failureSnippet() = %q, want it to contain the assertion line", got)
+	}
+
+	if got := failureSnippet("nothing error-like in here at all just build output"); got == "" {
+		// this line itself contains "error", so it should still be found;
+		// the real no-match case is tested separately below.
+		t.Errorf("failureSnippet() unexpectedly empty for a line containing 'error'")
+	}
+
+	if got := failureSnippet("clean build, nothing to see, all good"); got != "" {
+		t.Errorf("failureSnippet() = %q, want empty for a log with no error-like line", got)
 	}
 }

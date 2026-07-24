@@ -57,6 +57,23 @@
 // confirmed match. This is best-effort pattern matching, not a real parser:
 // it will miss test frameworks it doesn't recognize, and a job with multiple
 // simultaneous test failures only looks at the first one found in the log.
+//
+// A sixth gap, raised directly by a rust-analyzer maintainer on the same
+// issue as the lint-job one above: a CI job that never fails separately from
+// its siblings is redundant by design, so most real, well-designed CI jobs
+// are *expected* to be capable of failing alone sometimes; that alone was
+// never good evidence. That critique lands fully on the raw job-isolation
+// signal, before any log verification. It lands much less on a CONFIRMED
+// result, because that's no longer "this job failed alone," it's "the exact
+// same test failed on unrelated changes," which survives the redundancy
+// argument regardless of whether the job itself is redundant. The gap was
+// UNVERIFIED: a result with no log evidence at all was still being shown
+// with the same visual weight as a real finding, on frameworks this doesn't
+// have a regex for. Rather than hide those (which would make the tool go
+// silent on every framework except the four it knows syntax for), unnamed
+// occurrences are now compared by raw failure-text similarity, framework
+// vocabulary aside, so there's still evidence behind a result, just weaker
+// and labeled as such (LIKELY), rather than none at all.
 package main
 
 import (
@@ -235,26 +252,32 @@ func run(ownerRepo string, rest []string) error {
 // where extraction failed) so the caller can print them alongside each run.
 //
 //   - CONFIRMED: <name>, every occurrence where a name was found agrees
+//   - LIKELY, no exact test name recognized anywhere, but the raw failure
+//     text is similar enough across occurrences to suggest the same failure
 //   - REJECTED: different tests failed (<name a> vs <name b>), likely not
 //     flakiness, likely the "monolithic test suite" job-granularity problem
-//   - UNVERIFIED, couldn't extract a test name from any occurrence's log;
-//     the job-name-level correlation still stands, just unconfirmed
+//   - UNVERIFIED, no name extracted and the raw failure text isn't similar
+//     enough either; the job-name-level correlation still stands, unconfirmed
 func verifyAgainstLogs(ctx context.Context, client *github.Client, httpClient *http.Client, owner, repo string, failures []isolatedFailure) (verdict string, testNames []string) {
 	testNames = make([]string, len(failures))
+	snippets := make([]string, len(failures))
 	for i, f := range failures {
-		name, err := fetchFailedTestName(ctx, client, httpClient, owner, repo, f.jobID)
+		name, snippet, err := fetchLogExtract(ctx, client, httpClient, owner, repo, f.jobID)
 		if err != nil {
 			continue // log unavailable or unreadable; leave this occurrence blank
 		}
 		testNames[i] = name
+		snippets[i] = snippet
 	}
-	return verdictFromTestNames(testNames), testNames
+	return verdictFromTestNames(testNames, snippets), testNames
 }
 
 // verdictFromTestNames is the pure decision logic behind verifyAgainstLogs,
 // split out so it can be unit tested without downloading anything: given the
-// (possibly partially empty) list of test names extracted per occurrence, it
-// decides whether the occurrences agree, disagree, or yielded nothing usable.
+// (possibly partially empty) list of test names extracted per occurrence,
+// and the failure-text snippet for each (used as a fallback when no name was
+// extracted), it decides whether the occurrences agree, disagree, look
+// similar, or yielded nothing usable.
 //
 // A common failure mode this has to account for (found testing against
 // encode/httpx): GitHub only retains job logs for a limited window (90 days
@@ -264,7 +287,7 @@ func verifyAgainstLogs(ctx context.Context, client *github.Client, httpClient *h
 // Agreement across 1 readable log out of 8 is real, but much weaker evidence
 // than agreement across, say, 2 out of 2. The verdict says so explicitly
 // rather than presenting both as equally "CONFIRMED."
-func verdictFromTestNames(testNames []string) string {
+func verdictFromTestNames(testNames []string, snippets []string) string {
 	found := map[string]bool{}
 	readable := 0
 	for _, name := range testNames {
@@ -276,6 +299,9 @@ func verdictFromTestNames(testNames []string) string {
 
 	switch len(found) {
 	case 0:
+		if snippetsLookSimilar(snippets) {
+			return "LIKELY (similar failure text, no recognized test-name format)"
+		}
 		return "UNVERIFIED"
 	case 1:
 		var name string
@@ -296,30 +322,31 @@ func verdictFromTestNames(testNames []string) string {
 	}
 }
 
-func fetchFailedTestName(ctx context.Context, client *github.Client, httpClient *http.Client, owner, repo string, jobID int64) (string, error) {
+func fetchLogExtract(ctx context.Context, client *github.Client, httpClient *http.Client, owner, repo string, jobID int64) (testName, snippet string, err error) {
 	logURL, _, err := client.Actions.GetWorkflowJobLogs(ctx, owner, repo, jobID, 0)
 	if err != nil {
-		return "", fmt.Errorf("getting log URL: %w", err)
+		return "", "", fmt.Errorf("getting log URL: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, logURL.String(), nil)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("downloading log: %w", err)
+		return "", "", fmt.Errorf("downloading log: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("downloading log: unexpected status %s", resp.Status)
+		return "", "", fmt.Errorf("downloading log: unexpected status %s", resp.Status)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return extractFailedTestName(string(body)), nil
+	cleaned := cleanLog(string(body))
+	return extractFailedTestNameFromCleaned(cleaned), failureSnippet(cleaned), nil
 }
 
 // friendlyError turns GitHub's rate-limit error into an actionable message.
@@ -505,14 +532,126 @@ func deepestMochaHeading(lines []string, indent int) string {
 	return last
 }
 
-func extractFailedTestName(log string) string {
-	cleaned := ansiEscape.ReplaceAllString(logLinePrefix.ReplaceAllString(log, ""), "")
+func cleanLog(log string) string {
+	return ansiEscape.ReplaceAllString(logLinePrefix.ReplaceAllString(log, ""), "")
+}
+
+func extractFailedTestNameFromCleaned(cleaned string) string {
 	for _, pattern := range failedTestPatterns {
 		if m := pattern.FindStringSubmatch(cleaned); m != nil {
 			return m[1]
 		}
 	}
 	return extractMochaFailedTest(cleaned)
+}
+
+func extractFailedTestName(log string) string {
+	return extractFailedTestNameFromCleaned(cleanLog(log))
+}
+
+// failureErrorLine matches a line that plausibly names or introduces an
+// error, framework-agnostically: the vocabulary an error/exception/panic/
+// assertion message uses is far more consistent across test frameworks than
+// their pass/fail report formats are.
+var failureErrorLine = regexp.MustCompile(`(?i)error|exception|panic|assert|fail`)
+
+// failureSnippet pulls a small window of text around the last error-looking
+// line in a cleaned log, as a framework-agnostic fallback for comparing
+// occurrences when no exact test name could be extracted. The last such line
+// is used, not the first, because early false-positive matches are common
+// (dependency installation logs, tool banners) while the real failure is
+// reliably near the end of a failing job's log.
+func failureSnippet(cleaned string) string {
+	lines := strings.Split(cleaned, "\n")
+	lastIdx := -1
+	for i, line := range lines {
+		if failureErrorLine.MatchString(line) {
+			lastIdx = i
+		}
+	}
+	if lastIdx == -1 {
+		return ""
+	}
+	start := lastIdx - 3
+	if start < 0 {
+		start = 0
+	}
+	end := lastIdx + 8
+	if end > len(lines) {
+		end = len(lines)
+	}
+	return strings.Join(lines[start:end], "\n")
+}
+
+// snippetWordRe pulls out alphabetic tokens for similarity comparison,
+// dropping punctuation, numbers, and symbols entirely: line numbers, memory
+// addresses, timestamps, and run-specific IDs are exactly the kind of noise
+// that would make two occurrences of the *same* underlying failure look
+// different if compared verbatim, while the words in an error message
+// (exception class, assertion text, function names) are what's actually
+// diagnostic.
+var snippetWordRe = regexp.MustCompile(`[A-Za-z_]+`)
+
+func snippetWords(snippet string) map[string]bool {
+	words := map[string]bool{}
+	for _, w := range snippetWordRe.FindAllString(strings.ToLower(snippet), -1) {
+		if len(w) >= 3 {
+			words[w] = true
+		}
+	}
+	return words
+}
+
+// snippetSimilarity is the Jaccard index (intersection over union) of the
+// two snippets' word sets. Chosen over edit distance or line-diffing because
+// it's insensitive to line reordering and to the exact punctuation/spacing
+// differences between frameworks, while still being cheap and dependency-free.
+func snippetSimilarity(a, b string) float64 {
+	wa, wb := snippetWords(a), snippetWords(b)
+	if len(wa) == 0 || len(wb) == 0 {
+		return 0
+	}
+	intersection := 0
+	for w := range wa {
+		if wb[w] {
+			intersection++
+		}
+	}
+	union := len(wa) + len(wb) - intersection
+	if union == 0 {
+		return 0
+	}
+	return float64(intersection) / float64(union)
+}
+
+// similarityThreshold is a heuristic cutoff, not a calibrated statistic:
+// there's no labeled dataset of "same failure, different framework" pairs to
+// tune against, so this is picked to require substantial, not incidental,
+// word overlap.
+const similarityThreshold = 0.5
+
+// snippetsLookSimilar requires every pair among the non-empty snippets to
+// clear similarityThreshold, not just the closest pair, so one coincidental
+// overlap among several unrelated failures can't manufacture a LIKELY result
+// on its own.
+func snippetsLookSimilar(snippets []string) bool {
+	nonEmpty := make([]string, 0, len(snippets))
+	for _, s := range snippets {
+		if s != "" {
+			nonEmpty = append(nonEmpty, s)
+		}
+	}
+	if len(nonEmpty) < 2 {
+		return false
+	}
+	for i := 0; i < len(nonEmpty); i++ {
+		for j := i + 1; j < len(nonEmpty); j++ {
+			if snippetSimilarity(nonEmpty[i], nonEmpty[j]) < similarityThreshold {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func jobsForCorrelation(jobs []*github.WorkflowJob) []*github.WorkflowJob {
