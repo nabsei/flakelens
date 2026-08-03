@@ -2,8 +2,11 @@
 
 [![CI](https://github.com/nabsei/flakelens/actions/workflows/ci.yml/badge.svg)](https://github.com/nabsei/flakelens/actions/workflows/ci.yml)
 
-Find flaky (not broken) CI jobs from the GitHub Actions history a repo
-already has. No rerun, no test-report artifact, no config.
+**For maintainers whose CI has gotten too big to eyeball.** Once a repo runs
+enough jobs across enough PRs, "is this red X a real bug, or just that flaky
+job again?" stops being answerable from memory. flakelens answers it from
+the GitHub Actions history the repo already has — no rerun, no test-report
+artifact, no config.
 
 ```
 $ GITHUB_TOKEN=$(gh auth token) flakelens denoland/deno
@@ -14,11 +17,14 @@ Jobs that failed in isolation (siblings in the same run passed) on 2+ distinct b
     commit 39c22a20, branch main, https://github.com/denoland/deno/actions/runs/30036918944 (specs::upgrade::stable)
 ```
 
-Both runs above are unrelated merges to `main` (one an HTTP stream fix, one
-an FFI fix), yet both fail on the exact same test, `specs::upgrade::stable`.
-flakelens downloaded both logs and extracted that test name itself. See
-[How it works](#how-it-works). Two unrelated PRs, same test breaking in
-isolation both times. That's the signal this tool is built to find.
+That's a real run against `denoland/deno` — hundreds of jobs per PR, exactly
+the scale where flaky signal drowns in noise. Both runs above are unrelated
+merges to `main` (one an HTTP stream fix, one an FFI fix), yet both fail on
+the exact same test, `specs::upgrade::stable`. flakelens downloaded both
+logs and extracted that test name itself. See [How it works](#how-it-works).
+Two unrelated PRs, same test breaking in isolation both times — the signal
+this tool is built to find, at a scale no maintainer is going to spot by
+scrolling the Actions tab.
 
 ## Install
 
